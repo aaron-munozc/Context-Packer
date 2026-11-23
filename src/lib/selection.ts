@@ -1,5 +1,5 @@
 import type { FileNode, QuickFilter } from '@/lib/types'
-import { matchesGlob } from '@/lib/fuzzy'
+import { matchesGlob, validateGlob } from '@/lib/fuzzy'
 
 export type SelectionState = {
   quickRules: Set<string>
@@ -12,6 +12,11 @@ export type FolderSelection = {
   selected: number
   eligible: number
 }
+
+const CONFIG_FILE_NAMES = new Set([
+  '.editorconfig', '.gitattributes', '.gitignore', '.npmrc', '.nvmrc', '.prettierrc', '.eslintrc',
+  'dockerfile', 'makefile', 'justfile',
+])
 
 export const QUICK_FILTERS: readonly QuickFilter[] = [
   { id: 'python', label: 'Python', hint: '*.py', extensions: ['py', 'pyi'] },
@@ -46,7 +51,12 @@ function getExtension(node: FileNode): string {
 }
 
 function getQuickRuleForNode(node: FileNode): QuickFilter | undefined {
-  return QUICK_FILTERS.find((rule) => node.kind === 'file' && rule.extensions.includes(getExtension(node)))
+  if (node.kind !== 'file') return undefined
+  const fileName = node.name.toLowerCase()
+  const configRule = QUICK_FILTERS.find((rule) => rule.id === 'config')
+  // Dot-config files such as `.env` often have no filesystem extension.
+  if (fileName.startsWith('.env') || CONFIG_FILE_NAMES.has(fileName)) return configRule
+  return QUICK_FILTERS.find((rule) => rule.extensions.includes(getExtension(node)))
 }
 
 export function isSelected(node: FileNode, state: SelectionState): boolean {
@@ -73,12 +83,15 @@ export function toggleQuickRule(state: SelectionState, ruleId: string): Selectio
 }
 
 export function addGlobRule(state: SelectionState, rawPattern: string): SelectionState {
-  const pattern = rawPattern.trim()
-  if (!pattern || state.globRules.has(pattern)) return state
+  const validation = validateGlob(rawPattern)
+  if (!validation.valid || state.globRules.has(validation.pattern)) return state
+  const pattern = validation.pattern
   return { ...state, globRules: new Set([...state.globRules, pattern]) }
 }
 
-export function removeGlobRule(state: SelectionState, pattern: string): SelectionState {
+export function removeGlobRule(state: SelectionState, rawPattern: string): SelectionState {
+  const validation = validateGlob(rawPattern)
+  const pattern = validation.valid ? validation.pattern : rawPattern.trim()
   if (!state.globRules.has(pattern)) return state
   const globRules = new Set(state.globRules)
   globRules.delete(pattern)
@@ -99,9 +112,22 @@ export function setManyFileOverrides(state: SelectionState, paths: readonly stri
 }
 
 export function setFolderRule(state: SelectionState, path: string, value: boolean): SelectionState {
+  const normalizedPath = normalize(path)
+  const isWithinFolder = (candidate: string) => normalizedPath === '' || candidate === normalizedPath || candidate.startsWith(`${normalizedPath}/`)
   const folderRules = new Map(state.folderRules)
-  folderRules.set(normalize(path), value)
-  return { ...state, folderRules }
+  const fileOverrides = new Map(state.fileOverrides)
+
+  // A folder checkbox is an explicit group action. Remove more-specific rules
+  // and one-off exceptions underneath it so the selected state really applies
+  // to the whole group. Users can add fresh file exceptions afterward.
+  for (const rulePath of folderRules.keys()) {
+    if (rulePath !== normalizedPath && isWithinFolder(rulePath)) folderRules.delete(rulePath)
+  }
+  for (const filePath of fileOverrides.keys()) {
+    if (isWithinFolder(filePath)) fileOverrides.delete(filePath)
+  }
+  folderRules.set(normalizedPath, value)
+  return { ...state, folderRules, fileOverrides }
 }
 
 export function deriveSelection(nodes: readonly FileNode[], state: SelectionState) {
@@ -132,13 +158,6 @@ export function deriveSelection(nodes: readonly FileNode[], state: SelectionStat
 
 export function clearSelection(): SelectionState {
   return createSelectionState()
-}
-
-/** Select the entire current scan with one root rule instead of one map entry per file. */
-export function selectAllFiles(): SelectionState {
-  const state = createSelectionState()
-  state.folderRules.set('', true)
-  return state
 }
 
 export function buildRuleSummary(state: SelectionState): string {

@@ -12,9 +12,9 @@
   "app": {
     "windows": [
       {
-        "title": "context-packer",
-        "width": 800,
-        "height": 600
+        "title": "Context Packer",
+        "width": 1400,
+        "height": 720
       }
     ],
     "security": {

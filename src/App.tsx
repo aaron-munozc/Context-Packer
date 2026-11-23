@@ -10,12 +10,11 @@ import {
   Gauge,
   RefreshCw,
   Settings2,
-  Sparkles,
   Trash2,
 } from 'lucide-react'
 import { useDeferredValue, useEffect, useMemo, useRef, useState } from 'react'
 import { exportFiles, scanFolder } from './lib/api'
-import { fuzzyMatch } from './lib/fuzzy'
+import { fuzzyMatch, validateGlob } from './lib/fuzzy'
 import {
   addGlobRule,
   buildRuleSummary,
@@ -27,7 +26,6 @@ import {
   setFileOverride,
   setFolderRule,
   setManyFileOverrides,
-  selectAllFiles,
   toggleQuickRule,
 } from './lib/selection'
 import type { FileNode, ExportProgress, ExportResult, ExportSettings, ScanOptions, ScanProgress } from './lib/types'
@@ -36,6 +34,7 @@ import { DEFAULT_SCAN_OPTIONS, FilterControls } from './components/FilterControl
 import { GlobManager } from './components/GlobManager'
 import { SelectedQueue } from './components/SelectedQueue'
 import { ExporterModal } from './components/ExporterModal'
+import logoUrl from './assets/logo.png'
 import './index.css'
 
 const defaultSettings: ExportSettings = {
@@ -46,31 +45,46 @@ const defaultSettings: ExportSettings = {
   maxLines: 2000,
 }
 
-const SCAN_OPTIONS_STORAGE_KEY = 'context-forge.scan-options.v1'
-const EXPORT_SETTINGS_STORAGE_KEY = 'context-forge.export-settings.v1'
+const SCAN_OPTIONS_STORAGE_KEY = 'context-packer.scan-options.v1'
+const EXPORT_SETTINGS_STORAGE_KEY = 'context-packer.export-settings.v1'
 
 function loadScanOptions(): ScanOptions {
   try {
-    const stored = JSON.parse(localStorage.getItem(SCAN_OPTIONS_STORAGE_KEY) ?? 'null') as Partial<ScanOptions> | null
+    const storedValue = localStorage.getItem(SCAN_OPTIONS_STORAGE_KEY)
+    const stored = JSON.parse(storedValue ?? 'null') as Partial<ScanOptions> | null
+    const customExcludeGlobs = Array.isArray(stored?.customExcludeGlobs)
+      ? stored.customExcludeGlobs
+          .filter((item): item is string => typeof item === 'string')
+          .map((item) => validateGlob(item))
+          .filter((item): item is Extract<ReturnType<typeof validateGlob>, { valid: true }> => item.valid)
+          .map((item) => item.pattern)
+      : []
     return {
-      ...DEFAULT_SCAN_OPTIONS,
-      ...(stored ?? {}),
-      customExcludeGlobs: Array.isArray(stored?.customExcludeGlobs)
-        ? stored.customExcludeGlobs.filter((item): item is string => typeof item === 'string')
-        : [],
+      filterHidden: typeof stored?.filterHidden === 'boolean' ? stored.filterHidden : DEFAULT_SCAN_OPTIONS.filterHidden,
+      filterIgnored: typeof stored?.filterIgnored === 'boolean' ? stored.filterIgnored : DEFAULT_SCAN_OPTIONS.filterIgnored,
+      filterDependencyBuild: typeof stored?.filterDependencyBuild === 'boolean' ? stored.filterDependencyBuild : DEFAULT_SCAN_OPTIONS.filterDependencyBuild,
+      filterLockfiles: typeof stored?.filterLockfiles === 'boolean' ? stored.filterLockfiles : DEFAULT_SCAN_OPTIONS.filterLockfiles,
+      filterBinary: typeof stored?.filterBinary === 'boolean' ? stored.filterBinary : DEFAULT_SCAN_OPTIONS.filterBinary,
+      customExcludeGlobs: [...new Set(customExcludeGlobs)],
     }
   } catch {
-    return { ...DEFAULT_SCAN_OPTIONS }
+    return { ...DEFAULT_SCAN_OPTIONS, customExcludeGlobs: [] }
   }
 }
 
-function loadExportSettings(): ExportSettings {
+function  loadExportSettings(): ExportSettings {
   try {
-    const stored = JSON.parse(localStorage.getItem(EXPORT_SETTINGS_STORAGE_KEY) ?? 'null') as Partial<ExportSettings> | null
+    const storedValue = localStorage.getItem(EXPORT_SETTINGS_STORAGE_KEY)
+    const stored = JSON.parse(storedValue ?? 'null') as Partial<ExportSettings> | null
+
     return {
-      ...defaultSettings,
-      ...(stored ?? {}),
-      maxLines: Number.isFinite(stored?.maxLines) && Number(stored?.maxLines) > 0 ? Number(stored?.maxLines) : defaultSettings.maxLines,
+      outputDir: typeof stored?.outputDir === 'string' ? stored.outputDir : defaultSettings.outputDir,
+      baseName: typeof stored?.baseName === 'string' ? stored.baseName : defaultSettings.baseName,
+      separator: typeof stored?.separator === 'string' ? stored.separator.replace(/[\r\n]/g, '') : defaultSettings.separator,
+      includePaths: typeof stored?.includePaths === 'boolean' ? stored.includePaths : defaultSettings.includePaths,
+      maxLines: Number.isFinite(stored?.maxLines) && Number(stored?.maxLines) > 0
+        ? Math.floor(Number(stored?.maxLines))
+        : defaultSettings.maxLines,
     }
   } catch {
     return { ...defaultSettings }
@@ -242,7 +256,7 @@ export default function App() {
 
   function selectMatching() {
     if (!deferredSearch.trim()) {
-      updateSelection(() => selectAllFiles())
+      updateSelection((current) => setFolderRule(current, '', true))
       return
     }
     updateSelection((current) => setManyFileOverrides(current, matchingFiles.map((file) => file.path), true))
@@ -266,8 +280,9 @@ export default function App() {
   }
 
   function toggleExcludeGlob(pattern: string, enabled: boolean) {
-    const cleanPattern = pattern.trim()
-    if (!cleanPattern) return
+    const validation = validateGlob(pattern)
+    if (!validation.valid) return
+    const cleanPattern = validation.pattern
     const current = scanOptions.customExcludeGlobs
     const nextGlobs = enabled
       ? [...new Set([...current, cleanPattern])]
@@ -306,27 +321,36 @@ export default function App() {
   }
 
   return (
-    <div className="flex h-full min-h-0 flex-col bg-[#090c11] text-slate-100">
-      <header className="flex h-14 shrink-0 items-center justify-between border-b border-slate-800/80 bg-slate-950/70 px-4">
-        <div className="flex min-w-0 items-center gap-3">
-          <div className="grid size-8 shrink-0 place-items-center rounded-lg border border-indigo-400/20 bg-indigo-500/10 text-indigo-300"><Sparkles className="size-4" /></div>
-          <div className="min-w-0">
-            <div className="flex items-center gap-2">
-              <h1 className="text-sm font-semibold tracking-tight">Context Forge</h1>
-              <span className="rounded-full border border-slate-800 px-1.5 py-0.5 text-[0.55rem] font-semibold uppercase tracking-widest text-slate-600">local</span>
+    <div className="app-shell">
+      <header className="app-topbar">
+        <div className="app-brand">
+          <div className="app-brand-mark"><img src={logoUrl} alt="Context Packer logo" /></div>
+          <div className="app-brand-copy">
+            <div className="app-brand-title-row">
+              <h1 className="app-brand-title">Context Packer</h1>
+              <span className="app-brand-tag">Local workspace</span>
             </div>
-            <p className="max-w-xl truncate text-xs text-slate-600">Build focused, reproducible context packs from source folders.</p>
+            <p className="app-brand-subtitle">Shape your codebase into focused, AI-ready context.</p>
           </div>
         </div>
-        <div className="flex shrink-0 items-center gap-3 text-xs text-slate-600">
-          {scanning && <span className="inline-flex items-center gap-2 text-indigo-300"><RefreshCw className="size-3.5 animate-spin" />Scanning {scanProgress.toLocaleString()}</span>}
-          {exporting && exportProgress && <span className="inline-flex items-center gap-2 text-amber-300"><RefreshCw className="size-3.5 animate-spin" />Exporting {exportProgress.current}/{exportProgress.total}</span>}
-          {rootPath && <button type="button" onClick={() => void rescan()} disabled={scanning} className="inline-flex items-center gap-1.5 rounded-md px-2 py-1.5 text-slate-500 hover:bg-slate-900 hover:text-slate-200 disabled:opacity-40" title="Rescan the current folder"><RefreshCw className="size-3.5" />Rescan</button>}
+        <div className="header-meta">
+          {scanning && <span className="header-progress"><RefreshCw className="size-3.5 spin" />Scanning {scanProgress.toLocaleString()}</span>}
+          {exporting && exportProgress && <span className="header-progress"><RefreshCw className="size-3.5 spin" />Exporting {exportProgress.current}/{exportProgress.total}</span>}
+          {!scanning && !exporting && <span className="header-status">{rootPath ? 'Workspace ready' : 'Ready when you are'}</span>}
+          {rootPath && <button type="button" onClick={() => void rescan()} disabled={scanning} className="header-rescan" title="Rescan the current folder"><RefreshCw className="size-3.5" />Rescan</button>}
         </div>
       </header>
 
-      <div className="grid min-h-0 flex-1 grid-cols-[minmax(0,1.55fr)_minmax(22rem,0.85fr)]">
-        <section className="flex min-h-0 min-w-0 flex-col border-r border-slate-800/80">
+      <div className="workspace-grid">
+        <section className="source-panel">
+          <div className="panel-heading">
+            <div>
+              <p className="panel-eyebrow">Workspace / 01</p>
+              <h2 className="panel-title">Source explorer</h2>
+              <p className="panel-description">Browse, filter and collect the files that matter.</p>
+            </div>
+            <div className="panel-heading-stat"><span className="status-dot" /><strong>{nodes.length.toLocaleString()}</strong> {nodes.length === 1 ? 'item' : 'items'}</div>
+          </div>
           <FilterControls
             rootPath={rootPath}
             search={search}
@@ -341,15 +365,15 @@ export default function App() {
             onToggleQuickRule={toggleQuick}
           />
 
-          <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-900 px-4 py-2 text-xs text-slate-600">
-            <div className="flex min-w-0 items-center gap-3">
-              <span>{nodes.length ? `${nodes.length.toLocaleString()} nodes in view` : 'No folder loaded'}</span>
-              {nodes.length > 0 && <span>{nodes.filter((node) => node.kind === 'file' && node.eligible).length.toLocaleString()} selectable files</span>}
-              {search && <span className="rounded-full bg-slate-900 px-2 py-1 text-slate-500">{matchingFiles.length.toLocaleString()} search matches</span>}
+          <div className="source-toolbar">
+            <div className="source-toolbar-meta">
+              <span>{nodes.length ? <><strong>{nodes.length.toLocaleString()}</strong> nodes</> : 'No folder loaded'}</span>
+              {nodes.length > 0 && <span><strong>{nodes.filter((node) => node.kind === 'file' && node.eligible).length.toLocaleString()}</strong> selectable files</span>}
+              {search && <span className="source-toolbar-pill">{matchingFiles.length.toLocaleString()} search matches</span>}
             </div>
-            <div className="flex shrink-0 items-center gap-1.5">
-              <button type="button" onClick={selectMatching} disabled={!matchingFiles.length || scanning} className="rounded-md border border-slate-800 px-2.5 py-1.5 text-slate-400 transition hover:border-indigo-500/30 hover:bg-indigo-500/5 hover:text-indigo-200 disabled:cursor-not-allowed disabled:opacity-30" title="Select every eligible file matching the current search">Select matching</button>
-              <button type="button" onClick={clearMatching} disabled={!matchingFiles.length || scanning} className="rounded-md border border-slate-800 px-2.5 py-1.5 text-slate-500 transition hover:border-slate-700 hover:bg-slate-900 hover:text-slate-200 disabled:cursor-not-allowed disabled:opacity-30" title="Remove matching files from the selection">Clear matching</button>
+            <div className="source-toolbar-actions">
+              <button type="button" onClick={selectMatching} disabled={!matchingFiles.length || scanning} className="source-toolbar-button is-primary" title="Select every eligible file matching the current search">Select matching</button>
+              <button type="button" onClick={clearMatching} disabled={!matchingFiles.length || scanning} className="source-toolbar-button" title="Remove matching files from the selection">Clear matching</button>
             </div>
           </div>
 
@@ -369,22 +393,22 @@ export default function App() {
           )}
         </section>
 
-        <aside className="flex min-h-0 min-w-0 flex-col bg-slate-950/35">
-          <div className="flex shrink-0 items-center justify-between border-b border-slate-800/80 px-4 py-3">
-            <div className="flex items-center gap-2">
-              <ClipboardList className="size-4 text-indigo-300" />
-              <div>
-                <h2 className="text-sm font-semibold text-slate-100">Selected queue</h2>
-                <p className="text-[0.65rem] text-slate-600">{ruleSummary}</p>
+        <aside className="queue-panel">
+          <div className="panel-heading queue-heading">
+            <div className="queue-heading-main">
+              <div className="queue-heading-icon"><ClipboardList className="size-4" /></div>
+              <div className="min-w-0">
+                <h2 className="queue-heading-title">Selected queue</h2>
+                <p className="queue-heading-subtitle">{selectedFiles.length.toLocaleString()} files selected · {ruleSummary}</p>
               </div>
             </div>
-            <div className="flex items-center gap-1">
-              <button type="button" onClick={undoSelection} disabled={selectionTimeline.past.length === 0} className="inline-flex items-center gap-1 rounded-md px-2 py-1.5 text-xs text-slate-500 transition hover:bg-slate-900 hover:text-slate-200 disabled:cursor-not-allowed disabled:opacity-25" title="Undo the most recent selection change"><ArrowLeft className="size-3.5" />Undo</button>
+            <div className="queue-heading-actions">
+              <button type="button" onClick={undoSelection} disabled={selectionTimeline.past.length === 0} className="queue-action-button" title="Undo the most recent selection change"><ArrowLeft className="size-3.5" />Undo</button>
               <button
                 type="button"
                 onClick={resetSelection}
                 disabled={!selectionHasRules}
-                className="inline-flex items-center gap-1.5 rounded-md px-2 py-1.5 text-xs text-slate-600 transition hover:bg-rose-500/10 hover:text-rose-300 disabled:cursor-default disabled:opacity-30"
+                className="queue-action-button is-danger"
                 title="Reset all selection rules and manual overrides"
               >
                 <Trash2 className="size-3.5" />Reset
@@ -399,32 +423,32 @@ export default function App() {
             onRemoveGlobRule={(pattern) => updateSelection((current) => removeGlobRule(current, pattern))}
           />
 
-          <div className="shrink-0 border-t border-slate-800/80 p-3">
-            <div className="rounded-xl border border-slate-800 bg-slate-950/70 p-3">
-              <div className="flex items-center justify-between">
-                <div className="flex items-center gap-2">
-                  <FileOutput className="size-4 text-emerald-300" />
-                  <span className="text-sm font-semibold text-slate-100">Export</span>
+          <div className="export-footer">
+            <div className="export-card">
+              <div className="export-card-heading">
+                <div className="export-card-title-wrap">
+                  <FileOutput className="size-4 export-card-icon" />
+                  <span className="export-card-title">Export package</span>
                 </div>
-                <button type="button" onClick={() => setSettingsOpen(true)} className="grid size-8 place-items-center rounded-lg text-slate-600 hover:bg-slate-900 hover:text-slate-300" title="Open export settings"><Settings2 className="size-4" /></button>
+                <button type="button" onClick={() => setSettingsOpen(true)} className="export-settings-button" title="Open export settings"><Settings2 className="size-4" /></button>
               </div>
 
-              <div className="mt-3 grid grid-cols-3 gap-2">
+              <div className="export-metrics">
                 <Metric label="Files" value={selectedFiles.length.toLocaleString()} />
                 <Metric label="Size" value={formatBytes(selectedBytes)} />
                 <Metric label="Part limit" value={`${settings.maxLines.toLocaleString()} lines`} />
               </div>
 
-              <div className="mt-3 space-y-2 text-xs">
-                <div className="flex items-center gap-2 text-slate-500"><FolderOpen className="size-3.5" /><span className="truncate" title={settings.outputDir}>{settings.outputDir || 'Choose an output folder'}</span></div>
-                <div className="flex items-center gap-2 text-slate-500"><Gauge className="size-3.5" /><span className="truncate">{settings.baseName}_partN.txt · {settings.includePaths ? 'path headers on' : 'path headers off'} · separator “{settings.separator}”</span></div>
+              <div className="export-detail-list">
+                <div className="export-detail"><FolderOpen className="size-3.5" /><span title={settings.outputDir}>{settings.outputDir || 'Choose an output folder'}</span></div>
+                <div className="export-detail"><Gauge className="size-3.5" /><span>{settings.baseName}_partN.txt · {settings.includePaths ? 'path headers on' : 'path headers off'} · separator “{settings.separator}”</span></div>
               </div>
 
               <button
                 type="button"
                 onClick={() => setSettingsOpen(true)}
                 disabled={selectedFiles.length === 0 || exporting}
-                className="mt-4 flex w-full items-center justify-center gap-2 rounded-lg bg-indigo-500 px-4 py-2.5 text-sm font-semibold text-white transition hover:bg-indigo-400 disabled:cursor-not-allowed disabled:opacity-30"
+                className="export-primary-button"
               >
                 <ArrowDownToLine className="size-4" />Configure & export
               </button>
@@ -432,10 +456,10 @@ export default function App() {
           </div>
 
           {(exportError || exportResult) && (
-            <div className="shrink-0 px-3 pb-3">
-              {exportError && <div className="rounded-xl border border-rose-500/20 bg-rose-500/4 px-3 py-2.5 text-xs text-rose-300">{exportError}</div>}
+            <div className="shrink-0">
+              {exportError && <div className="export-message is-error">{exportError}</div>}
               {exportResult && (
-                <div className="rounded-xl border border-emerald-500/20 bg-emerald-500/4 px-3 py-2.5 text-xs text-emerald-200">
+                <div className="export-message is-success">
                   <div className="flex items-center gap-2 font-semibold"><Check className="size-3.5" />Export complete</div>
                   <p className="mt-1 text-emerald-300/60">{exportResult.filesWritten} source files → {exportResult.parts.length} part{exportResult.parts.length === 1 ? '' : 's'}. {exportResult.oversizedFiles.length ? `${exportResult.oversizedFiles.length} file${exportResult.oversizedFiles.length === 1 ? '' : 's'} exceeded the line target but remained intact.` : ''}</p>
                   <div className="mt-2 space-y-1">
@@ -474,9 +498,9 @@ export default function App() {
 
 function Metric({ label, value }: { label: string; value: string }) {
   return (
-    <div className="rounded-lg border border-slate-900 bg-slate-900/45 px-2.5 py-2">
-      <p className="text-[0.6rem] font-semibold uppercase tracking-wider text-slate-600">{label}</p>
-      <p className="mt-0.5 truncate text-xs font-semibold tabular-nums text-slate-300">{value}</p>
+    <div className="metric-card">
+      <p className="metric-label">{label}</p>
+      <p className="metric-value">{value}</p>
     </div>
   )
 }

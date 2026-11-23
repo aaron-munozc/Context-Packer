@@ -155,15 +155,25 @@ async fn scan_folder(
 fn build_glob_set(patterns: &[String]) -> Result<GlobSet, String> {
     let mut builder = GlobSetBuilder::new();
     for raw_pattern in patterns {
-        let pattern = raw_pattern.trim().replace('\\', "/");
+        let pattern = raw_pattern.trim().replace('\\', "/").trim_start_matches("./").to_string();
         if pattern.is_empty() {
             continue;
         }
+        let has_windows_drive_prefix = pattern.as_bytes().get(1) == Some(&b':')
+            && pattern.as_bytes().first().map_or(false, |byte| byte.is_ascii_alphabetic());
+        if pattern.starts_with('/') || has_windows_drive_prefix || pattern.split('/').any(|part| part == "..") {
+            return Err(format!("Exclude glob '{raw_pattern}' must stay inside the selected project folder"));
+        }
+
+        // A trailing slash explicitly identifies a directory. Add both the
+        // directory itself and its descendants so WalkBuilder can prune it.
+        let directory_only = pattern.ends_with('/');
+        let cleaned = pattern.trim_end_matches('/');
         // A filename-only rule should apply at every depth, not just the root.
-        let normalized = if pattern.contains('/') {
-            pattern
+        let normalized = if cleaned.contains('/') {
+            cleaned.to_string()
         } else {
-            format!("**/{pattern}")
+            format!("**/{cleaned}")
         };
         let glob = GlobBuilder::new(&normalized)
             .case_insensitive(true)
@@ -171,10 +181,31 @@ fn build_glob_set(patterns: &[String]) -> Result<GlobSet, String> {
             .build()
             .map_err(|error| format!("Invalid exclude glob '{raw_pattern}': {error}"))?;
         builder.add(glob);
+
+        if directory_only {
+            let descendants = format!("{normalized}/**");
+            let glob = GlobBuilder::new(&descendants)
+                .case_insensitive(true)
+                .literal_separator(true)
+                .build()
+                .map_err(|error| format!("Invalid directory exclude glob '{raw_pattern}': {error}"))?;
+            builder.add(glob);
+        }
     }
     builder
         .build()
         .map_err(|error| format!("Cannot compile custom exclude globs: {error}"))
+}
+
+fn clean_display_path(path: &Path) -> String {
+    let raw = path.to_string_lossy();
+    #[cfg(windows)]
+    if let Some(stripped) = raw.strip_prefix(r"\\?\UNC\") {
+        return format!(r"\\{stripped}");
+    } else if let Some(stripped) = raw.strip_prefix(r"\\?\") {
+        return stripped.to_string();
+    }
+    raw.into_owned()
 }
 
 fn scan_folder_blocking(
@@ -377,7 +408,7 @@ fn scan_folder_blocking(
     let _ = app.emit("scan-progress", ScanProgress { visited });
 
     Ok(ScanResult {
-        root: root.display().to_string(),
+        root: clean_display_path(&root),
         nodes,
         stats: ScanStats {
             visible_files,
@@ -448,7 +479,7 @@ fn export_files_blocking(
         .unwrap_or_default()
         .as_nanos();
     let stage_dir = output_dir.join(format!(
-        ".{base_name}.context-forge-stage-{}-{stamp}",
+        ".{base_name}.context-packer-stage-{}-{stamp}",
         std::process::id()
     ));
     fs::create_dir(&stage_dir)
@@ -469,7 +500,7 @@ fn export_files_blocking(
     }
 
     result.parts = (1..=result.parts.len())
-        .map(|part| output_dir.join(format!("{base_name}_part{part}.txt")).display().to_string())
+        .map(|part| clean_display_path(&output_dir.join(format!("{base_name}_part{part}.txt"))))
         .collect();
     let _ = fs::remove_dir_all(&stage_dir);
     Ok(result)
@@ -763,7 +794,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![scan_folder, export_files])
         .run(tauri::generate_context!())
-        .expect("error while running Context Forge");
+        .expect("error while running Context Packer");
 }
 
 #[cfg(test)]
@@ -791,6 +822,33 @@ mod tests {
         assert!(matcher.is_match(Path::new("cache.tmp")));
         assert!(matcher.is_match(Path::new("src/generated/cache.tmp")));
         assert!(!matcher.is_match(Path::new("src/generated/cache.rs")));
+    }
+
+    #[test]
+    fn trailing_slash_globs_match_directories_and_their_contents() {
+        let patterns = vec!["vendor/".to_string()];
+        let matcher = build_glob_set(&patterns).expect("directory glob should compile");
+        assert!(matcher.is_match(Path::new("vendor")));
+        assert!(matcher.is_match(Path::new("vendor/library/source.rs")));
+        assert!(!matcher.is_match(Path::new("src/vendor.rs")));
+    }
+
+    #[test]
+    fn custom_globs_reject_parent_directory_segments_and_absolute_paths() {
+        assert!(build_glob_set(&["../outside/**".to_string()]).is_err());
+        assert!(build_glob_set(&["src/../../outside".to_string()]).is_err());
+        assert!(build_glob_set(&["C:/outside/**".to_string()]).is_err());
+    }
+
+    #[test]
+    fn scan_defaults_keep_the_standard_exclusions_enabled() {
+        let options = ScanOptions::default();
+        assert!(options.filter_hidden);
+        assert!(options.filter_ignored);
+        assert!(options.filter_dependency_build);
+        assert!(options.filter_lockfiles);
+        assert!(options.filter_binary);
+        assert!(options.custom_exclude_globs.is_empty());
     }
 
     #[test]

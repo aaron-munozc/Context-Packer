@@ -122,7 +122,7 @@ export function FileTree({
   const virtualizer = useVirtualizer({
     count: visibleRows.length,
     getScrollElement: () => scrollRef.current,
-    estimateSize: () => 32,
+    estimateSize: () => 34,
     overscan: 24,
   })
 
@@ -136,12 +136,12 @@ export function FileTree({
   }
 
   return (
-    <div ref={scrollRef} className="min-h-0 flex-1 overflow-auto bg-slate-950/25">
+    <div ref={scrollRef} className="file-tree-scroll">
       {visibleRows.length === 0 ? (
-        <div className="flex h-full items-center justify-center px-6 text-center text-sm text-slate-600">
+        <div className="tree-empty-state">
           <div>
-            <p className="text-slate-400">{emptyMessage}</p>
-            <p className="mt-1 text-xs">Try clearing the search or changing visibility filters.</p>
+            <p className="tree-empty-title">{emptyMessage}</p>
+            <p className="tree-empty-hint">Try clearing the search or changing visibility filters.</p>
           </div>
         </div>
       ) : (
@@ -157,7 +157,7 @@ export function FileTree({
                 key={node.path || '__root__'}
                 ref={virtualizer.measureElement}
                 data-index={virtualRow.index}
-                className="absolute left-0 right-0 h-8 px-2"
+                className="absolute left-0 right-0 h-[34px] px-1"
                 style={{ transform: `translateY(${virtualRow.start}px)` }}
               >
                 <TreeRow
@@ -225,9 +225,7 @@ function TreeRow({
 
   return (
     <div
-      className={`group flex h-8 w-full items-center rounded-md pr-2 text-sm transition ${
-        selectable ? 'cursor-pointer hover:bg-slate-900/80' : 'cursor-default'
-      } ${node.path === '' ? 'bg-slate-900/50 font-medium' : ''}`}
+      className={`file-tree-row group ${selectable ? 'is-selectable' : ''} ${node.path === '' ? 'is-root font-medium' : ''} ${muted ? 'is-muted' : ''}`}
       style={{ paddingLeft: `${0.35 + depth * 0.9}rem` }}
       onClick={selectable ? onToggle : undefined}
       title={node.path || node.name}
@@ -235,7 +233,7 @@ function TreeRow({
       {childrenExist ? (
         <button
           type="button"
-          className="mr-1 grid size-5 place-items-center rounded text-slate-600 hover:bg-slate-800 hover:text-slate-300"
+          className="tree-expand-button mr-1"
           onClick={(event) => {
             event.stopPropagation()
             onToggleExpand()
@@ -258,12 +256,12 @@ function TreeRow({
           event.stopPropagation()
           if (selectable) onToggleSelection()
         }}
-        className="mr-2 size-3.5 shrink-0 cursor-pointer rounded border-slate-700 bg-slate-900 disabled:opacity-30"
+        className="tree-checkbox"
         aria-label={node.kind === 'dir' ? `Select folder ${node.name}` : `Select ${node.name}`}
       />
 
       <NodeIcon node={node} expanded={expanded} />
-      <span className={`ml-2 min-w-0 flex-1 truncate ${muted ? 'text-slate-500' : 'text-slate-300'}`}>
+      <span className="tree-node-name">
         {node.name}
       </span>
 
@@ -271,7 +269,7 @@ function TreeRow({
       {node.excluded && <Badge>{formatExcludeReason(node.excludedReason)}</Badge>}
       {node.kind === 'file' && !node.eligible && <Badge>not exportable</Badge>}
       {node.kind === 'file' && node.size > 0 && (
-        <span className="ml-2 hidden shrink-0 text-[0.65rem] tabular-nums text-slate-700 group-hover:inline">
+        <span className="tree-node-size hidden group-hover:inline">
           {formatBytes(node.size)}
         </span>
       )}
@@ -293,22 +291,22 @@ function formatExcludeReason(reason: ExcludeReason | null): string {
 }
 
 function Badge({ children }: { children: ReactNode }) {
-  return <span className="ml-2 shrink-0 rounded bg-slate-900 px-1.5 py-0.5 text-[0.6rem] font-medium uppercase tracking-wide text-slate-600">{children}</span>
+  return <span className="tree-node-badge">{children}</span>
 }
 
 function NodeIcon({ node, expanded }: { node: FileNode; expanded: boolean }) {
   if (node.kind === 'dir') {
-    return expanded ? <FolderOpen className="size-4 shrink-0 text-indigo-300" /> : <Folder className="size-4 shrink-0 text-indigo-400/80" />
+    return expanded ? <FolderOpen className="size-4 shrink-0 tree-icon-folder" /> : <Folder className="size-4 shrink-0 tree-icon-folder" />
   }
 
   const ext = node.extension?.toLowerCase()
   const className = 'size-4 shrink-0'
-  if (ext === 'py') return <FileCode2 className={`${className} text-amber-300`} />
-  if (['js', 'jsx', 'ts', 'tsx', 'mjs', 'cjs'].includes(ext ?? '')) return <Braces className={`${className} text-yellow-300`} />
-  if (['json', 'jsonc', 'yaml', 'yml', 'toml'].includes(ext ?? '')) return <FileJson className={`${className} text-emerald-300`} />
-  if (ext === 'rs') return <FileCode2 className={`${className} text-orange-300`} />
-  if (['html', 'htm', 'css', 'scss', 'vue', 'svelte'].includes(ext ?? '')) return <FileCode2 className={`${className} text-sky-300`} />
-  return <FileText className={`${className} text-slate-500`} />
+  if (ext === 'py') return <FileCode2 className={`${className} tree-icon-code`} />
+  if (['js', 'jsx', 'ts', 'tsx', 'mjs', 'cjs'].includes(ext ?? '')) return <Braces className={`${className} tree-icon-code`} />
+  if (['json', 'jsonc', 'yaml', 'yml', 'toml'].includes(ext ?? '')) return <FileJson className={`${className} tree-icon-data`} />
+  if (ext === 'rs') return <FileCode2 className={`${className} tree-icon-markup`} />
+  if (['html', 'htm', 'css', 'scss', 'vue', 'svelte'].includes(ext ?? '')) return <FileCode2 className={`${className} tree-icon-markup`} />
+  return <FileText className={`${className} tree-icon-generic`} />
 }
 
 function formatBytes(bytes: number): string {
