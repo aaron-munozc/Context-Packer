@@ -151,6 +151,7 @@ export function FileTree({
             if (!node) return null
             const state = node.kind === 'dir' ? folderState(folderSelection, node.path) : undefined
             const selected = node.kind === 'file' ? isSelected(node, selection) : state?.checked ?? false
+            const selectable = node.kind === 'file' ? node.eligible : (folderSelection.get(node.path)?.eligible ?? 0) > 0
             return (
               <div
                 key={node.path || '__root__'}
@@ -164,6 +165,7 @@ export function FileTree({
                   depth={depth}
                   checked={selected}
                   indeterminate={Boolean(state?.indeterminate)}
+                  selectable={selectable}
                   expanded={expanded.includes(node.path)}
                   onToggle={() => {
                     if (node.kind === 'dir') toggleExpanded(node.path)
@@ -197,6 +199,7 @@ function TreeRow({
   depth,
   checked,
   indeterminate,
+  selectable,
   expanded,
   onToggle,
   onToggleSelection,
@@ -206,6 +209,7 @@ function TreeRow({
   depth: number
   checked: boolean
   indeterminate: boolean
+  selectable: boolean
   expanded: boolean
   onToggle: () => void
   onToggleSelection: () => void
@@ -217,7 +221,6 @@ function TreeRow({
   }, [indeterminate])
 
   const childrenExist = node.kind === 'dir'
-  const selectable = node.kind === 'file' ? node.eligible : true
   const muted = node.ignored || node.excluded
 
   return (
@@ -255,7 +258,7 @@ function TreeRow({
           event.stopPropagation()
           if (selectable) onToggleSelection()
         }}
-        className="mr-2 size-3.5 shrink-0 cursor-pointer rounded border-slate-700 bg-slate-900 disabled:cursor-default disabled:opacity-30"
+        className="mr-2 size-3.5 shrink-0 cursor-pointer rounded border-slate-700 bg-slate-900 disabled:opacity-30"
         aria-label={node.kind === 'dir' ? `Select folder ${node.name}` : `Select ${node.name}`}
       />
 
@@ -266,6 +269,7 @@ function TreeRow({
 
       {node.ignored && <Badge>ignored</Badge>}
       {node.excluded && <Badge>{formatExcludeReason(node.excludedReason)}</Badge>}
+      {node.kind === 'file' && !node.eligible && <Badge>not exportable</Badge>}
       {node.kind === 'file' && node.size > 0 && (
         <span className="ml-2 hidden shrink-0 text-[0.65rem] tabular-nums text-slate-700 group-hover:inline">
           {formatBytes(node.size)}
@@ -281,6 +285,8 @@ function formatExcludeReason(reason: ExcludeReason | null): string {
       return 'dependency / build'
     case 'lockfile':
       return 'lockfile'
+    case 'binary':
+      return 'binary'
     default:
       return 'excluded'
   }

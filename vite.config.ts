@@ -2,9 +2,9 @@ import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 import { tanstackRouter } from '@tanstack/router-plugin/vite';
 import tailwindcss from '@tailwindcss/vite';
-// @ts-expect-error type error without @types/node package
-import process from "node:process";
 import path from "path";
+
+// @ts-expect-error type error without @types/node package
 const host = process.env.TAURI_DEV_HOST;
 
 // https://vite.dev/config/

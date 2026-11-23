@@ -1,9 +1,11 @@
-import type { FileNode, QuickFilter } from '../types'
+import type { FileNode, QuickFilter } from '@/lib/types'
+import { matchesGlob } from '@/lib/fuzzy'
 
 export type SelectionState = {
   quickRules: Set<string>
   folderRules: Map<string, boolean>
   fileOverrides: Map<string, boolean>
+  globRules: Set<string>
 }
 
 export type FolderSelection = {
@@ -12,55 +14,28 @@ export type FolderSelection = {
 }
 
 export const QUICK_FILTERS: readonly QuickFilter[] = [
-  {
-    id: 'python',
-    label: 'Python',
-    hint: '*.py',
-    extensions: ['py'],
-  },
-  {
-    id: 'js-ts',
-    label: 'JS / TS',
-    hint: '*.js · *.ts · *.jsx · *.tsx',
-    extensions: ['js', 'jsx', 'ts', 'tsx', 'mjs', 'cjs'],
-  },
-  {
-    id: 'rust',
-    label: 'Rust',
-    hint: '*.rs',
-    extensions: ['rs'],
-  },
-  {
-    id: 'web',
-    label: 'Web',
-    hint: '*.css · *.html · *.vue · *.svelte',
-    extensions: ['css', 'scss', 'html', 'htm', 'vue', 'svelte'],
-  },
-  {
-    id: 'data',
-    label: 'Data',
-    hint: '*.json · *.yaml · *.toml',
-    extensions: ['json', 'jsonc', 'yaml', 'yml', 'toml'],
-  },
+  { id: 'python', label: 'Python', hint: '*.py', extensions: ['py', 'pyi'] },
+  { id: 'js-ts', label: 'JS / TS', hint: '*.js · *.ts · *.jsx · *.tsx', extensions: ['js', 'jsx', 'ts', 'tsx', 'mjs', 'cjs', 'mts', 'cts'] },
+  { id: 'rust', label: 'Rust', hint: '*.rs', extensions: ['rs'] },
+  { id: 'web', label: 'Web', hint: '*.css · *.html · *.vue · *.svelte', extensions: ['css', 'scss', 'sass', 'less', 'html', 'htm', 'vue', 'svelte'] },
+  { id: 'data', label: 'Data', hint: '*.json · *.yaml · *.toml', extensions: ['json', 'jsonc', 'yaml', 'yml', 'toml', 'xml'] },
+  { id: 'docs', label: 'Docs', hint: '*.md · *.mdx · *.txt', extensions: ['md', 'mdx', 'txt', 'rst', 'adoc'] },
+  { id: 'config', label: 'Config', hint: 'common config files', extensions: ['ini', 'conf', 'cfg', 'env', 'properties'] },
 ]
 
 export function createSelectionState(): SelectionState {
-  return {
-    quickRules: new Set(),
-    folderRules: new Map(),
-    fileOverrides: new Map(),
-  }
+  return { quickRules: new Set(), folderRules: new Map(), fileOverrides: new Map(), globRules: new Set() }
 }
 
 function normalize(path: string): string {
-  return path.replaceAll('\\', '/').replace(/^\.?\//, '').replace(/\/$/, '')
+  return path.replace(/\\/g, '/').replace(/^\.?\//, '').replace(/\/$/, '')
 }
 
 function parentPaths(path: string): string[] {
   const parts = normalize(path).split('/').filter(Boolean)
   const result: string[] = []
-  for (let i = parts.length - 1; i > 0; i -= 1) {
-    result.push(parts.slice(0, i).join('/'))
+  for (let index = parts.length - 1; index > 0; index -= 1) {
+    result.push(parts.slice(0, index).join('/'))
   }
   result.push('')
   return result
@@ -70,14 +45,8 @@ function getExtension(node: FileNode): string {
   return node.extension?.toLowerCase() ?? ''
 }
 
-function quickFilterMatches(node: FileNode, rule: QuickFilter): boolean {
-  return rule.extensions.includes(getExtension(node))
-}
-
 function getQuickRuleForNode(node: FileNode): QuickFilter | undefined {
-  return QUICK_FILTERS.find(
-    (rule) => node.kind === 'file' && rule.extensions.includes(getExtension(node)),
-  )
+  return QUICK_FILTERS.find((rule) => node.kind === 'file' && rule.extensions.includes(getExtension(node)))
 }
 
 export function isSelected(node: FileNode, state: SelectionState): boolean {
@@ -91,8 +60,9 @@ export function isSelected(node: FileNode, state: SelectionState): boolean {
     if (folderRule !== undefined) return folderRule
   }
 
-  const rule = getQuickRuleForNode(node)
-  return rule ? state.quickRules.has(rule.id) : false
+  if ([...state.globRules].some((pattern) => matchesGlob(node.path, pattern))) return true
+  const quickRule = getQuickRuleForNode(node)
+  return quickRule ? state.quickRules.has(quickRule.id) : false
 }
 
 export function toggleQuickRule(state: SelectionState, ruleId: string): SelectionState {
@@ -102,29 +72,36 @@ export function toggleQuickRule(state: SelectionState, ruleId: string): Selectio
   return { ...state, quickRules }
 }
 
-export function setFileOverride(
-  state: SelectionState,
-  path: string,
-  value: boolean,
-): SelectionState {
+export function addGlobRule(state: SelectionState, rawPattern: string): SelectionState {
+  const pattern = rawPattern.trim()
+  if (!pattern || state.globRules.has(pattern)) return state
+  return { ...state, globRules: new Set([...state.globRules, pattern]) }
+}
+
+export function removeGlobRule(state: SelectionState, pattern: string): SelectionState {
+  if (!state.globRules.has(pattern)) return state
+  const globRules = new Set(state.globRules)
+  globRules.delete(pattern)
+  return { ...state, globRules }
+}
+
+export function setFileOverride(state: SelectionState, path: string, value: boolean): SelectionState {
   const fileOverrides = new Map(state.fileOverrides)
   fileOverrides.set(path, value)
   return { ...state, fileOverrides }
 }
 
-export function setFolderRule(
-  state: SelectionState,
-  path: string,
-  value: boolean,
-): SelectionState {
+export function setManyFileOverrides(state: SelectionState, paths: readonly string[], value: boolean): SelectionState {
+  if (!paths.length) return state
+  const fileOverrides = new Map(state.fileOverrides)
+  for (const path of paths) fileOverrides.set(path, value)
+  return { ...state, fileOverrides }
+}
+
+export function setFolderRule(state: SelectionState, path: string, value: boolean): SelectionState {
   const folderRules = new Map(state.folderRules)
   folderRules.set(normalize(path), value)
   return { ...state, folderRules }
-}
-
-export function countQuickRuleMatches(nodes: readonly FileNode[], ruleId: string): number {
-  const rule = QUICK_FILTERS.find((candidate) => candidate.id === ruleId)
-  return rule ? nodes.filter((node) => node.kind === 'file' && node.eligible && quickFilterMatches(node, rule)).length : 0
 }
 
 export function deriveSelection(nodes: readonly FileNode[], state: SelectionState) {
@@ -133,7 +110,6 @@ export function deriveSelection(nodes: readonly FileNode[], state: SelectionStat
 
   for (const node of nodes) {
     if (node.kind !== 'file' || !node.eligible) continue
-
     const selected = isSelected(node, state)
     if (selected) selectedFiles.push(node)
 
@@ -150,7 +126,7 @@ export function deriveSelection(nodes: readonly FileNode[], state: SelectionStat
     }
   }
 
-  selectedFiles.sort((a, b) => a.path.localeCompare(b.path, undefined, { numeric: true }))
+  selectedFiles.sort((a, b) => a.path.localeCompare(b.path, undefined, { numeric: true, sensitivity: 'base' }))
   return { selectedFiles, folderSelection }
 }
 
@@ -158,13 +134,18 @@ export function clearSelection(): SelectionState {
   return createSelectionState()
 }
 
+/** Select the entire current scan with one root rule instead of one map entry per file. */
+export function selectAllFiles(): SelectionState {
+  const state = createSelectionState()
+  state.folderRules.set('', true)
+  return state
+}
+
 export function buildRuleSummary(state: SelectionState): string {
-  const quick = state.quickRules.size
-  const folder = state.folderRules.size
-  const overrides = state.fileOverrides.size
   const parts: string[] = []
-  if (quick) parts.push(`${quick} extension ${quick === 1 ? 'rule' : 'rules'}`)
-  if (folder) parts.push(`${folder} folder ${folder === 1 ? 'rule' : 'rules'}`)
-  if (overrides) parts.push(`${overrides} manual ${overrides === 1 ? 'override' : 'overrides'}`)
+  if (state.quickRules.size) parts.push(`${state.quickRules.size} quick ${state.quickRules.size === 1 ? 'rule' : 'rules'}`)
+  if (state.globRules.size) parts.push(`${state.globRules.size} glob ${state.globRules.size === 1 ? 'rule' : 'rules'}`)
+  if (state.folderRules.size) parts.push(`${state.folderRules.size} folder ${state.folderRules.size === 1 ? 'rule' : 'rules'}`)
+  if (state.fileOverrides.size) parts.push(`${state.fileOverrides.size} manual ${state.fileOverrides.size === 1 ? 'override' : 'overrides'}`)
   return parts.length ? parts.join(' · ') : 'No selection rules'
 }

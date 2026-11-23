@@ -1,7 +1,7 @@
 export type NodeKind = 'dir' | 'file'
 
 /** Mirrors Rust's `ExcludeReason` (`#[serde(rename_all = "kebab-case")]`). */
-export type ExcludeReason = 'dependency-build' | 'lockfile'
+export type ExcludeReason = 'dependency-build' | 'lockfile' | 'binary'
 
 export type FileNode = {
   path: string
@@ -18,11 +18,14 @@ export type FileNode = {
   eligible: boolean
 }
 
+/** True means the category is filtered out of the tree during scanning. */
 export type ScanOptions = {
-  showHidden: boolean
-  showIgnored: boolean
-  showExcluded: boolean
-  showLockfiles: boolean
+  filterHidden: boolean
+  filterIgnored: boolean
+  filterDependencyBuild: boolean
+  filterLockfiles: boolean
+  filterBinary: boolean
+  customExcludeGlobs: string[]
 }
 
 export type ScanStats = {
@@ -70,4 +73,11 @@ export type QuickFilter = {
   label: string
   hint: string
   extensions: readonly string[]
+}
+
+export type SavedGlob = {
+  id: string
+  name: string
+  pattern: string
+  mode: 'select' | 'exclude'
 }

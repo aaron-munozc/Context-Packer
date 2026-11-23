@@ -1,9 +1,11 @@
+use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use ignore::WalkBuilder;
 use serde::{Deserialize, Serialize};
 use std::{
     fs::{self, File},
-    io::{self, BufWriter, Write},
+    io::{self, BufReader, BufWriter, Read, Write},
     path::{Component, Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
 };
 use tauri::{AppHandle, Emitter};
 
@@ -23,10 +25,10 @@ const LOCKFILES: &[&str] = &[
     "yarn.lock",
 ];
 const BINARY_EXTENSIONS: &[&str] = &[
-    "7z", "avi", "bin", "bmp", "class", "db", "dll", "dylib", "eot", "exe", "flac", "gif", "gz",
-    "ico", "jar", "jpeg", "jpg", "mkv", "mov", "mp3", "mp4", "ogg", "otf", "pdf", "rar", "so",
-    "sqlite", "sqlite3", "tar", "tif", "tiff", "ttf", "wasm", "wav", "webm", "webp", "woff",
-    "woff2", "xz", "zip", "zst",
+    "7z", "avi", "bin", "bmp", "class", "db", "dll", "dylib", "eot", "exe", "flac",
+    "gif", "gz", "ico", "jar", "jpeg", "jpg", "mkv", "mov", "mp3", "mp4", "ogg",
+    "otf", "pdf", "rar", "so", "sqlite", "sqlite3", "tar", "tif", "tiff", "ttf",
+    "wasm", "wav", "webm", "webp", "woff", "woff2", "xz", "zip", "zst",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -41,15 +43,31 @@ pub enum NodeKind {
 pub enum ExcludeReason {
     DependencyBuild,
     Lockfile,
+    Binary,
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", default)]
 struct ScanOptions {
-    show_hidden: bool,
-    show_ignored: bool,
-    show_excluded: bool,
-    show_lockfiles: bool,
+    filter_hidden: bool,
+    filter_ignored: bool,
+    filter_dependency_build: bool,
+    filter_lockfiles: bool,
+    filter_binary: bool,
+    custom_exclude_globs: Vec<String>,
+}
+
+impl Default for ScanOptions {
+    fn default() -> Self {
+        Self {
+            filter_hidden: true,
+            filter_ignored: true,
+            filter_dependency_build: true,
+            filter_lockfiles: true,
+            filter_binary: true,
+            custom_exclude_globs: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -130,8 +148,33 @@ async fn scan_folder(
     tauri::async_runtime::spawn_blocking(move || {
         scan_folder_blocking(app, PathBuf::from(root), options)
     })
-        .await
-        .map_err(|error| format!("scan worker failed: {error}"))?
+    .await
+    .map_err(|error| format!("scan worker failed: {error}"))?
+}
+
+fn build_glob_set(patterns: &[String]) -> Result<GlobSet, String> {
+    let mut builder = GlobSetBuilder::new();
+    for raw_pattern in patterns {
+        let pattern = raw_pattern.trim().replace('\\', "/");
+        if pattern.is_empty() {
+            continue;
+        }
+        // A filename-only rule should apply at every depth, not just the root.
+        let normalized = if pattern.contains('/') {
+            pattern
+        } else {
+            format!("**/{pattern}")
+        };
+        let glob = GlobBuilder::new(&normalized)
+            .case_insensitive(true)
+            .literal_separator(true)
+            .build()
+            .map_err(|error| format!("Invalid exclude glob '{raw_pattern}': {error}"))?;
+        builder.add(glob);
+    }
+    builder
+        .build()
+        .map_err(|error| format!("Cannot compile custom exclude globs: {error}"))
 }
 
 fn scan_folder_blocking(
@@ -144,6 +187,10 @@ fn scan_folder_blocking(
         return Err("The selected path is not a folder.".into());
     }
 
+    let custom_globs = build_glob_set(&options.custom_exclude_globs)?;
+
+    // This matcher is kept enabled even when ignored files are shown, so each row
+    // can still be labeled as ignored in the UI.
     let mut matcher_builder = WalkBuilder::new(&root);
     matcher_builder
         .standard_filters(false)
@@ -159,17 +206,17 @@ fn scan_folder_blocking(
     walker
         .standard_filters(false)
         .hidden(false)
-        .ignore(!options.show_ignored)
-        .git_ignore(!options.show_ignored)
-        .git_global(!options.show_ignored)
-        .git_exclude(!options.show_ignored)
+        .ignore(options.filter_ignored)
+        .git_ignore(options.filter_ignored)
+        .git_global(options.filter_ignored)
+        .git_exclude(options.filter_ignored)
         .follow_links(false);
 
-    let show_hidden = options.show_hidden;
-    let show_excluded = options.show_excluded;
-    let show_lockfiles = options.show_lockfiles;
-
     let filter_root = root.clone();
+    let filter_hidden = options.filter_hidden;
+    let filter_dependency_build = options.filter_dependency_build;
+    let filter_lockfiles = options.filter_lockfiles;
+    let filter_binary = options.filter_binary;
     walker.filter_entry(move |entry| {
         let path = entry.path();
         if path == filter_root {
@@ -180,27 +227,24 @@ fn scan_folder_blocking(
             return false;
         };
 
-        if !show_hidden && is_hidden_relative(relative) {
+        if filter_hidden && is_hidden_relative(relative) {
+            return false;
+        }
+        if filter_dependency_build && contains_excluded_dir(relative) {
             return false;
         }
 
-        if !show_excluded && contains_excluded_dir(relative) {
+        let file_type = entry.file_type();
+        let is_file = file_type.map_or(false, |kind| kind.is_file());
+        if filter_lockfiles && is_file && relative.file_name().map_or(false, is_lockfile) {
             return false;
         }
-
-        let is_file = entry.file_type().map_or(false, |kind| kind.is_file());
-
-        if !show_lockfiles
-            && is_file
-            && relative.file_name().map_or(false, is_lockfile)
-        {
+        if filter_binary && is_file && is_binary_extension(path) {
             return false;
         }
-
-        if is_file && is_binary_extension(path) {
+        if custom_globs.is_match(relative) {
             return false;
         }
-
         true
     });
 
@@ -241,11 +285,9 @@ fn scan_folder_blocking(
         };
 
         let path = entry.path();
-
         if path == root {
             continue;
         }
-
         let Some(relative) = path.strip_prefix(&root).ok() else {
             continue;
         };
@@ -262,7 +304,6 @@ fn scan_folder_blocking(
         let file_type = entry.file_type();
         let is_dir = file_type.map_or(false, |kind| kind.is_dir());
         let is_file = file_type.map_or(false, |kind| kind.is_file());
-
         if !is_dir && !is_file {
             continue;
         }
@@ -271,17 +312,22 @@ fn scan_folder_blocking(
             .first_mut()
             .map_or(false, |matcher| matcher.matched(relative, is_dir).is_ignore());
         let hidden = is_hidden_relative(relative);
-        let excluded_dir = contains_excluded_dir(relative);
+        let dependency_dir = contains_excluded_dir(relative);
         let lockfile = is_file && relative.file_name().map_or(false, is_lockfile);
-        let excluded_reason = if excluded_dir {
+        let binary = is_file && is_binary_extension(path);
+        let excluded_reason = if dependency_dir {
             Some(ExcludeReason::DependencyBuild)
         } else if lockfile {
             Some(ExcludeReason::Lockfile)
+        } else if binary {
+            Some(ExcludeReason::Binary)
         } else {
             None
         };
         let excluded = excluded_reason.is_some();
-        let eligible = is_file && !lockfile && !is_binary_extension(path);
+        // Binary files can be displayed when the filter is disabled, but are
+        // intentionally never exportable as text context.
+        let eligible = is_file && !binary;
         let size = if is_file {
             fs::metadata(path).map_or(0, |metadata| metadata.len())
         } else {
@@ -294,7 +340,7 @@ fn scan_folder_blocking(
         let depth = relative.components().count();
         let name = relative
             .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
+            .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_else(|| relative_string.clone());
 
         if is_file {
@@ -353,8 +399,8 @@ async fn export_files(
     tauri::async_runtime::spawn_blocking(move || {
         export_files_blocking(app, PathBuf::from(root), relative_paths, settings)
     })
-        .await
-        .map_err(|error| format!("export worker failed: {error}"))?
+    .await
+    .map_err(|error| format!("export worker failed: {error}"))?
 }
 
 fn export_files_blocking(
@@ -363,8 +409,8 @@ fn export_files_blocking(
     mut relative_paths: Vec<String>,
     settings: ExportSettings,
 ) -> Result<ExportResult, String> {
-    let root =
-        fs::canonicalize(&root).map_err(|error| format!("Cannot access source folder: {error}"))?;
+    let root = fs::canonicalize(&root)
+        .map_err(|error| format!("Cannot access source folder: {error}"))?;
     if !root.is_dir() {
         return Err("The source root is not a folder.".into());
     }
@@ -380,18 +426,62 @@ fn export_files_blocking(
     if relative_paths.is_empty() {
         return Err("No files were selected.".into());
     }
+    if settings.output_dir.trim().is_empty() {
+        return Err("Choose an output folder before exporting.".into());
+    }
 
     relative_paths.sort_unstable();
     relative_paths.dedup();
 
-    let output_dir = PathBuf::from(&settings.output_dir);
-    fs::create_dir_all(&output_dir)
+    let requested_output_dir = PathBuf::from(&settings.output_dir);
+    fs::create_dir_all(&requested_output_dir)
         .map_err(|error| format!("Cannot create output folder: {error}"))?;
+    let output_dir = fs::canonicalize(&requested_output_dir)
+        .map_err(|error| format!("Cannot resolve output folder: {error}"))?;
+    if !output_dir.is_dir() {
+        return Err("The output path is not a folder.".into());
+    }
 
     let base_name = sanitize_base_name(&settings.base_name);
-    cleanup_previous_outputs(&output_dir, &base_name)
-        .map_err(|error| format!("Cannot prepare output folder: {error}"))?;
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let stage_dir = output_dir.join(format!(
+        ".{base_name}.context-forge-stage-{}-{stamp}",
+        std::process::id()
+    ));
+    fs::create_dir(&stage_dir)
+        .map_err(|error| format!("Cannot create temporary export workspace: {error}"))?;
 
+    let staged = write_export_stage(&app, &root, &relative_paths, &settings, &stage_dir);
+    let mut result = match staged {
+        Ok(result) => result,
+        Err(error) => {
+            let _ = fs::remove_dir_all(&stage_dir);
+            return Err(error);
+        }
+    };
+
+    if let Err(error) = publish_staged_parts(&stage_dir, &output_dir, &base_name, result.parts.len()) {
+        let _ = fs::remove_dir_all(&stage_dir);
+        return Err(error);
+    }
+
+    result.parts = (1..=result.parts.len())
+        .map(|part| output_dir.join(format!("{base_name}_part{part}.txt")).display().to_string())
+        .collect();
+    let _ = fs::remove_dir_all(&stage_dir);
+    Ok(result)
+}
+
+fn write_export_stage(
+    app: &AppHandle,
+    root: &Path,
+    relative_paths: &[String],
+    settings: &ExportSettings,
+    stage_dir: &Path,
+) -> Result<ExportResult, String> {
     let total = relative_paths.len();
     let mut parts = Vec::<String>::new();
     let mut current_part = 0usize;
@@ -401,49 +491,54 @@ fn export_files_blocking(
     let mut writer: Option<BufWriter<File>> = None;
 
     for (index, relative) in relative_paths.iter().enumerate() {
-        let source = safe_join(&root, relative)?;
-        let bytes = fs::read(&source).map_err(|error| format!("Cannot read {relative}: {error}"))?;
-
-        let file_content_lines = count_bytes_lines(&bytes);
+        let source = safe_join(root, relative)?;
+        if is_binary_extension(&source) {
+            return Err(format!("Binary files cannot be exported as text context: {relative}"));
+        }
+        let (file_lines, has_bytes, ends_with_newline) = inspect_file_lines(&source)
+            .map_err(|error| format!("Cannot inspect {relative}: {error}"))?;
         let header_lines = if settings.include_paths { 1 } else { 0 };
-        let separator_lines = 1;
-        let block_lines = file_content_lines + header_lines + separator_lines;
+        // Every file block ends with one separator line, including empty files.
+        let block_lines = file_lines + header_lines + 1;
 
-        if file_content_lines > settings.max_lines {
+        if file_lines > settings.max_lines {
             oversized_files.push(relative.clone());
         }
 
-        if current_output_lines > 0 && current_output_lines + block_lines > settings.max_lines {
+        if current_output_lines > 0
+            && current_output_lines.saturating_add(block_lines) > settings.max_lines
+        {
             if let Some(mut active) = writer.take() {
                 active
                     .flush()
-                    .map_err(|error| format!("Cannot flush output: {error}"))?;
+                    .map_err(|error| format!("Cannot flush temporary output: {error}"))?;
             }
-            writer = None;
             current_output_lines = 0;
         }
 
         if writer.is_none() {
             current_part += 1;
-            let path = output_dir.join(format!("{base_name}_part{current_part}.txt"));
+            let path = stage_dir.join(format!("part{current_part}.txt"));
             let file = File::create(&path)
-                .map_err(|error| format!("Cannot create {}: {error}", path.display()))?;
+                .map_err(|error| format!("Cannot create temporary part: {error}"))?;
             writer = Some(BufWriter::new(file));
             parts.push(path.display().to_string());
         }
 
-        let active = writer.as_mut().expect("writer must exist");
-        write_buffered_block(
+        let active = writer.as_mut().expect("writer must exist after initialization");
+        write_file_block(
             active,
-            &bytes,
+            &source,
             relative,
             &settings.separator,
             settings.include_paths,
+            has_bytes,
+            ends_with_newline,
         )
-            .map_err(|error| format!("Cannot export {relative}: {error}"))?;
+        .map_err(|error| format!("Cannot export {relative}: {error}"))?;
 
-        current_output_lines += block_lines;
-        total_lines += block_lines;
+        current_output_lines = current_output_lines.saturating_add(block_lines);
+        total_lines = total_lines.saturating_add(block_lines);
 
         let _ = app.emit(
             "export-progress",
@@ -459,7 +554,7 @@ fn export_files_blocking(
     if let Some(mut active) = writer {
         active
             .flush()
-            .map_err(|error| format!("Cannot flush final output: {error}"))?;
+            .map_err(|error| format!("Cannot flush final temporary output: {error}"))?;
     }
 
     Ok(ExportResult {
@@ -470,12 +565,88 @@ fn export_files_blocking(
     })
 }
 
+fn publish_staged_parts(
+    stage_dir: &Path,
+    output_dir: &Path,
+    base_name: &str,
+    part_count: usize,
+) -> Result<(), String> {
+    let backup_dir = stage_dir.join("previous");
+    fs::create_dir(&backup_dir)
+        .map_err(|error| format!("Cannot prepare export rollback: {error}"))?;
+    let prefix = format!("{base_name}_part");
+
+    // Gather the old outputs before moving any of them. This keeps a directory
+    // enumeration error from leaving a half-moved set of previous exports.
+    let mut existing = Vec::<(PathBuf, PathBuf)>::new();
+    for entry in fs::read_dir(output_dir)
+        .map_err(|error| format!("Cannot inspect output folder: {error}"))?
+    {
+        let entry = entry.map_err(|error| format!("Cannot inspect output entry: {error}"))?;
+        let original = entry.path();
+        if is_generated_part_name(&entry.file_name(), &prefix) && original.is_file() {
+            existing.push((original, backup_dir.join(entry.file_name())));
+        }
+    }
+
+    let mut previous_files = Vec::<(PathBuf, PathBuf)>::new();
+    for (original, backup) in existing {
+        if let Err(error) = fs::rename(&original, &backup) {
+            for (old_path, backup_path) in previous_files.iter().rev() {
+                let _ = fs::rename(backup_path, old_path);
+            }
+            return Err(format!(
+                "Cannot protect previous output {}: {error}; previous outputs were restored where possible",
+                original.display()
+            ));
+        }
+        previous_files.push((original, backup));
+    }
+
+    let mut published = Vec::<PathBuf>::new();
+    for part in 1..=part_count {
+        let staged = stage_dir.join(format!("part{part}.txt"));
+        let destination = output_dir.join(format!("{base_name}_part{part}.txt"));
+        if let Err(error) = fs::rename(&staged, &destination) {
+            for path in &published {
+                let _ = fs::remove_file(path);
+            }
+            for (original, backup) in previous_files.iter().rev() {
+                let _ = fs::rename(backup, original);
+            }
+            return Err(format!(
+                "Cannot publish {}: {error}; previous outputs were restored where possible",
+                destination.display()
+            ));
+        }
+        published.push(destination);
+    }
+
+    // The stage directory (including backed-up older parts) is deleted only
+    // after every new part has been successfully published.
+    Ok(())
+}
+
+fn is_generated_part_name(name: &std::ffi::OsStr, prefix: &str) -> bool {
+    let Some(name) = name.to_str() else {
+        return false;
+    };
+    if !name.starts_with(prefix) || !name.ends_with(".txt") {
+        return false;
+    }
+    let middle = &name[prefix.len()..name.len() - 4];
+    !middle.is_empty() && middle.chars().all(|character| character.is_ascii_digit())
+}
+
 fn safe_join(root: &Path, relative: &str) -> Result<PathBuf, String> {
     let relative_path = Path::new(relative);
     if relative_path.is_absolute()
-        || relative_path
-        .components()
-        .any(|component| matches!(component, Component::ParentDir | Component::RootDir))
+        || relative_path.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
     {
         return Err(format!("Unsafe relative path: {relative}"));
     }
@@ -483,38 +654,49 @@ fn safe_join(root: &Path, relative: &str) -> Result<PathBuf, String> {
     let candidate = root.join(relative_path);
     let canonical = fs::canonicalize(&candidate)
         .map_err(|error| format!("Cannot resolve {relative}: {error}"))?;
-
     if !canonical.starts_with(root) {
-        return Err(format!(
-            "Selected path escapes the source folder: {relative}"
-        ));
+        return Err(format!("Selected path escapes the source folder: {relative}"));
     }
-
+    if !canonical.is_file() {
+        return Err(format!("Selected path is no longer a file: {relative}"));
+    }
     Ok(canonical)
 }
 
-fn count_bytes_lines(bytes: &[u8]) -> u64 {
-    if bytes.is_empty() {
-        return 0;
+fn inspect_file_lines(path: &Path) -> io::Result<(u64, bool, bool)> {
+    let mut reader = BufReader::new(File::open(path)?);
+    let mut buffer = [0u8; 64 * 1024];
+    let mut newline_count = 0u64;
+    let mut has_bytes = false;
+    let mut last_byte = 0u8;
+
+    loop {
+        let count = reader.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        has_bytes = true;
+        newline_count += buffer[..count].iter().filter(|&&byte| byte == b'\n').count() as u64;
+        last_byte = buffer[count - 1];
     }
 
-    let mut lines = bytes
-        .iter()
-        .filter(|&&b| b == b'\n')
-        .count() as u64;
-
-    if !bytes.ends_with(b"\n") {
-        lines += 1;
-    }
-    lines
+    let ends_with_newline = has_bytes && last_byte == b'\n';
+    let lines = if !has_bytes {
+        0
+    } else {
+        newline_count + u64::from(!ends_with_newline)
+    };
+    Ok((lines, has_bytes, ends_with_newline))
 }
 
-fn write_buffered_block<W: Write>(
+fn write_file_block<W: Write>(
     writer: &mut W,
-    bytes: &[u8],
+    source: &Path,
     relative: &str,
     separator: &str,
     include_path: bool,
+    has_bytes: bool,
+    ends_with_newline: bool,
 ) -> io::Result<()> {
     if include_path {
         writer.write_all(b"[")?;
@@ -522,34 +704,13 @@ fn write_buffered_block<W: Write>(
         writer.write_all(b"]\n")?;
     }
 
-    writer.write_all(bytes)?;
-
-    if !bytes.is_empty() && !bytes.ends_with(b"\n") {
+    let mut reader = BufReader::new(File::open(source)?);
+    io::copy(&mut reader, writer)?;
+    if has_bytes && !ends_with_newline {
         writer.write_all(b"\n")?;
     }
-
     writer.write_all(separator.as_bytes())?;
     writer.write_all(b"\n")?;
-    Ok(())
-}
-
-fn cleanup_previous_outputs(output_dir: &Path, base_name: &str) -> io::Result<()> {
-    if !output_dir.exists() {
-        return Ok(());
-    }
-
-    let prefix = format!("{base_name}_part");
-    for entry in fs::read_dir(output_dir)? {
-        let entry = entry?;
-        let file_name = entry.file_name();
-        let name = file_name.to_string_lossy();
-        if name.starts_with(&prefix) && name.ends_with(".txt") {
-            let middle = &name[prefix.len()..name.len() - 4];
-            if !middle.is_empty() && middle.chars().all(|c| c.is_ascii_digit()) {
-                let _ = fs::remove_file(entry.path());
-            }
-        }
-    }
     Ok(())
 }
 
@@ -573,27 +734,23 @@ fn sanitize_base_name(value: &str) -> String {
 
 fn is_hidden_relative(path: &Path) -> bool {
     path.components()
-        .any(|c| c.as_os_str().to_string_lossy().starts_with('.'))
+        .any(|component| component.as_os_str().to_string_lossy().starts_with('.'))
 }
 
 fn contains_excluded_dir(path: &Path) -> bool {
     path.components()
-        .any(|c| EXCLUDED_DIRS.contains(&c.as_os_str().to_str().unwrap_or_default()))
+        .any(|component| EXCLUDED_DIRS.contains(&component.as_os_str().to_str().unwrap_or_default()))
 }
 
 fn is_lockfile(name: &std::ffi::OsStr) -> bool {
-    name.to_str()
-        .map_or(false, |s| LOCKFILES.binary_search(&s).is_ok())
+    name.to_str().map_or(false, |value| LOCKFILES.contains(&value))
 }
 
 fn is_binary_extension(path: &Path) -> bool {
-    path.extension()
-        .and_then(|ext| ext.to_str())
-        .map_or(false, |ext| {
-            BINARY_EXTENSIONS
-                .binary_search(&ext.to_ascii_lowercase().as_str())
-                .is_ok()
-        })
+    path.extension().and_then(|extension| extension.to_str()).map_or(false, |extension| {
+        let extension = extension.to_ascii_lowercase();
+        BINARY_EXTENSIONS.contains(&extension.as_str())
+    })
 }
 
 fn path_to_slash_string(path: &Path) -> String {
@@ -604,8 +761,42 @@ fn path_to_slash_string(path: &Path) -> String {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![scan_folder, export_files])
         .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .expect("error while running Context Forge");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recognizes_lockfiles_without_relying_on_sorted_constants() {
+        assert!(is_lockfile(std::ffi::OsStr::new("Cargo.lock")));
+        assert!(is_lockfile(std::ffi::OsStr::new("package-lock.json")));
+        assert!(!is_lockfile(std::ffi::OsStr::new("Cargo.toml")));
+    }
+
+    #[test]
+    fn recognizes_binary_extensions_case_insensitively() {
+        assert!(is_binary_extension(Path::new("assets/Logo.PNG")));
+        assert!(is_binary_extension(Path::new("archive.ZIP")));
+        assert!(!is_binary_extension(Path::new("src/main.rs")));
+    }
+
+    #[test]
+    fn filename_only_custom_globs_match_at_any_depth() {
+        let patterns = vec!["*.tmp".to_string()];
+        let matcher = build_glob_set(&patterns).expect("glob should compile");
+        assert!(matcher.is_match(Path::new("cache.tmp")));
+        assert!(matcher.is_match(Path::new("src/generated/cache.tmp")));
+        assert!(!matcher.is_match(Path::new("src/generated/cache.rs")));
+    }
+
+    #[test]
+    fn unsafe_relative_paths_are_rejected() {
+        let root = Path::new(".");
+        assert!(safe_join(root, "../outside.txt").is_err());
+        assert!(safe_join(root, "nested/../../outside.txt").is_err());
+    }
 }
